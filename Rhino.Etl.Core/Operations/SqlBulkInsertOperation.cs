@@ -1,12 +1,14 @@
-using System.Configuration;
-using Rhino.Etl.Core.Infrastructure;
-
 namespace Rhino.Etl.Core.Operations
 {
     using System;
+    using System.Configuration;
+    using System.Linq;
     using System.Collections.Generic;
+    using System.Data;
     using System.Data.SqlClient;
-    using DataReaders;
+    using Rhino.Etl.Core.Infrastructure;
+    using Rhino.Etl.Core.DataReaders;
+
 
     /// <summary>
     /// Allows to execute an operation that perform a bulk insert into a sql server database
@@ -29,9 +31,9 @@ namespace Rhino.Etl.Core.Operations
         private string targetTable;
         private int timeout;
         private int batchSize;
-        private    int    notifyBatchSize;
+        private int notifyBatchSize;
         private SqlBulkCopyOptions bulkCopyOptions = SqlBulkCopyOptions.Default;
-        
+
 
         /// <summary>
         /// Initializes a new instance of the <see cref="SqlBulkInsertOperation"/> class.
@@ -39,9 +41,8 @@ namespace Rhino.Etl.Core.Operations
         /// <param name="connectionStringName">Name of the connection string.</param>
         /// <param name="targetTable">The target table.</param>
         protected SqlBulkInsertOperation(string connectionStringName, string targetTable)
-            : this(ConfigurationManager.ConnectionStrings[connectionStringName], targetTable)
+            : this(Use.ConnectionString(connectionStringName), targetTable)
         {
-
         }
 
         /// <summary>
@@ -52,7 +53,6 @@ namespace Rhino.Etl.Core.Operations
         protected SqlBulkInsertOperation(ConnectionStringSettings connectionStringSettings, string targetTable)
             : this(connectionStringSettings, targetTable, 600)
         {
-
         }
 
         /// <summary>
@@ -62,7 +62,7 @@ namespace Rhino.Etl.Core.Operations
         /// <param name="targetTable">The target table.</param>
         /// <param name="timeout">The timeout.</param>
         protected SqlBulkInsertOperation(string connectionStringName, string targetTable, int timeout)
-            : this(ConfigurationManager.ConnectionStrings[connectionStringName], targetTable, timeout)
+            : this(Use.ConnectionString(connectionStringName), targetTable, timeout)
         {
             Guard.Against(string.IsNullOrEmpty(targetTable), "TargetTable was not set, but it is mandatory");
             this.targetTable = targetTable;
@@ -100,8 +100,8 @@ namespace Rhino.Etl.Core.Operations
         ///    <summary>The batch size    value of the bulk insert operation</summary>
         public virtual int NotifyBatchSize
         {
-            get    { return notifyBatchSize>0 ? notifyBatchSize : batchSize; }
-            set    { notifyBatchSize =    value; }
+            get { return notifyBatchSize > 0 ? notifyBatchSize : batchSize; }
+            set { notifyBatchSize = value; }
         }
 
         /// <summary>The table or view to bulk load the data into.</summary>
@@ -208,7 +208,7 @@ namespace Rhino.Etl.Core.Operations
         /// to the WriteToServer method.</summary>
         public virtual void CreateInputSchema()
         {
-            foreach(KeyValuePair<string, string> pair in Mappings)
+            foreach (KeyValuePair<string, string> pair in Mappings)
             {
                 _inputSchema.Add(pair.Key, _schema[pair.Value]);
             }
@@ -224,11 +224,19 @@ namespace Rhino.Etl.Core.Operations
             PrepareMapping();
             CreateInputSchema();
             using (SqlConnection connection = (SqlConnection)Use.Connection(ConnectionStringSettings))
-            using (SqlTransaction transaction = (SqlTransaction) BeginTransaction(connection))
+            using (SqlTransaction transaction = (SqlTransaction)BeginTransaction(connection))
             {
                 sqlBulkCopy = CreateSqlBulkCopy(connection, transaction);
                 DictionaryEnumeratorDataReader adapter = new DictionaryEnumeratorDataReader(_inputSchema, rows);
-                sqlBulkCopy.WriteToServer(adapter);
+                try
+                {
+                    sqlBulkCopy.WriteToServer(adapter);
+                }
+                catch (InvalidOperationException)
+                {
+                    CompareSqlColumns(connection, transaction, rows);
+                    throw;
+                }
 
                 if (PipelineExecuter.HasErrors)
                 {
@@ -275,6 +283,103 @@ namespace Rhino.Etl.Core.Operations
             copy.DestinationTableName = TargetTable;
             copy.BulkCopyTimeout = Timeout;
             return copy;
+        }
+
+        private void CompareSqlColumns(SqlConnection connection, SqlTransaction transaction, IEnumerable<Row> rows)
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = "select * from {TargetTable} where 1=0".Replace("{TargetTable}", TargetTable);
+            command.CommandType = CommandType.Text;
+            command.Transaction = transaction;
+
+            using (var reader = command.ExecuteReader(CommandBehavior.KeyInfo))
+            {
+                var schemaTable = reader.GetSchemaTable();
+                var databaseColumns = schemaTable.Rows
+                    .OfType<DataRow>()
+                    .Select(r => new
+                    {
+                        Name = (string)r["ColumnName"],
+                        Type = (Type)r["DataType"],
+                        IsNullable = (bool)r["AllowDBNull"],
+                        MaxLength = (int)r["ColumnSize"]
+                    })
+                    .ToArray();
+
+                var missingColumns = _schema.Keys.Except(
+                    databaseColumns.Select(c => c.Name));
+                if (missingColumns.Any())
+                    throw new InvalidOperationException(
+                        "The following columns are not in the target table: " +
+                        string.Join(", ", missingColumns.ToArray()));
+                var differentColumns = _schema
+                    .Select(s => new
+                    {
+                        Name = s.Key,
+                        SchemaType = s.Value,
+                        DatabaseType = databaseColumns.Single(c => c.Name == s.Key)
+                    })
+                    .Where(c => !TypesMatch(c.SchemaType, c.DatabaseType.Type, c.DatabaseType.IsNullable));
+                if (differentColumns.Any())
+                    throw new InvalidOperationException(
+                        "The following columns have different types in the target table: " +
+                        string.Join(", ", differentColumns
+                            //.Select(c => $"{c.Name}: is {GetFriendlyName(c.SchemaType)}, but should be {GetFriendlyName(c.DatabaseType.Type)}{(c.DatabaseType.IsNullable ? "?" : "")}.")
+                            // c.Name, GetFriendlyName(c.SchemaType), GetFriendlyName(c.DatabaseType.Type), (c.DatabaseType.IsNullable ? \"?\" : \"\")
+                            .Select(c => string.Format("{0}: is {1}, but should be {2}{3}.", c.Name,
+                                GetFriendlyName(c.SchemaType), GetFriendlyName(c.DatabaseType.Type),
+                                (c.DatabaseType.IsNullable ? "?" : "")))
+                            .ToArray()
+                            ));
+                var stringsTooLong =
+                    (from column in databaseColumns
+                     where column.Type == typeof(string)
+                     from mapping in Mappings
+                     where mapping.Value == column.Name
+                     let name = mapping.Key
+                     from row in rows
+                     let value = (string)row[name]
+                     where value != null && value.Length > column.MaxLength
+                     select new { column.Name, column.MaxLength, Value = value })
+                    .ToArray();
+                if (stringsTooLong.Any())
+                    throw new InvalidOperationException(
+                        "The folowing columns have values too long for the target table: " +
+                        string.Join(", ", stringsTooLong
+                            .Select(s => "{s.Name}: max length is {s.MaxLength}, value is {s.Value}."
+                                .Replace("{s.Name}", s.Name)
+                                .Replace("{s.MaxLength}", s.MaxLength.ToString())
+                                .Replace("{s.Value}", s.Value)
+                            )
+                            .ToArray()));
+            }
+        }
+
+        private static string GetFriendlyName(Type type)
+        {
+            var friendlyName = type.Name;
+            if (!type.IsGenericType)
+                return friendlyName;
+
+            var iBacktick = friendlyName.IndexOf('`');
+            if (iBacktick > 0)
+                friendlyName = friendlyName.Remove(iBacktick);
+
+            var genericParameters = type.GetGenericArguments()
+                .Select(x => GetFriendlyName(x))
+                .ToArray();
+            friendlyName += "<" + string.Join(", ", genericParameters) + ">";
+
+            return friendlyName;
+        }
+
+        private bool TypesMatch(Type schemaType, Type databaseType, bool isNullable)
+        {
+            if (schemaType == databaseType)
+                return true;
+            if (isNullable && schemaType == typeof(Nullable<>).MakeGenericType(databaseType))
+                return true;
+            return false;
         }
     }
 }

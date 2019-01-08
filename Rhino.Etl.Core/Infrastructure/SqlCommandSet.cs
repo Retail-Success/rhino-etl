@@ -1,4 +1,5 @@
-﻿#region license
+﻿#if FEATURE_SQLCOMMANDSET
+#region license
 // Copyright (c) 2005 - 2007 Ayende Rahien (ayende@ayende.com)
 // All rights reserved.
 // 
@@ -29,7 +30,6 @@
 
 using System;
 using System.Data.SqlClient;
-using System.Diagnostics;
 using System.Reflection;
 
 namespace Rhino.Etl.Core.Infrastructure
@@ -60,8 +60,8 @@ namespace Rhino.Etl.Core.Infrastructure
 
         static SqlCommandSet()
         {
-            Assembly sysData = Assembly.Load("System.Data, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089");
-            sqlCmdSetType = sysData.GetType("System.Data.SqlClient.SqlCommandSet");
+            Assembly assembly = typeof(SqlDataAdapter).Assembly;
+            sqlCmdSetType = assembly.GetType("System.Data.SqlClient.SqlCommandSet");
             Guard.Against(sqlCmdSetType == null, "Could not find SqlCommandSet!");
         }
 
@@ -113,9 +113,11 @@ namespace Rhino.Etl.Core.Infrastructure
         /// <param name="command"></param>
         private static void AssertHasParameters(SqlCommand command)
         {
-            if(command.Parameters.Count==0)
+            if (command.Parameters.Count == 0 &&
+                (RuntimeInfo.Version.Contains("2.0") || RuntimeInfo.Version.Contains("1.1")))
             {
-                throw new ArgumentException("A command in SqlCommandSet must have parameters. You can't pass hardcoded sql strings.");
+                throw new ArgumentException(
+                    "A command in SqlCommandSet must have parameters. You can't pass hardcoded sql strings.");
             }
         }
         
@@ -196,3 +198,4 @@ namespace Rhino.Etl.Core.Infrastructure
         #endregion
     }
 }
+#endif

@@ -1,11 +1,10 @@
-using System.Configuration;
-using Rhino.Etl.Core.Enumerables;
-using Rhino.Etl.Core.Infrastructure;
-
 namespace Rhino.Etl.Core.Operations
 {
     using System.Collections.Generic;
+    using System.Configuration;
     using System.Data;
+    using Rhino.Etl.Core.Enumerables;
+    using Rhino.Etl.Core.Infrastructure;
 
     /// <summary>
     /// Generic output command operation
@@ -16,7 +15,8 @@ namespace Rhino.Etl.Core.Operations
         /// Initializes a new instance of the <see cref="OutputCommandOperation"/> class.
         /// </summary>
         /// <param name="connectionStringName">Name of the connection string.</param>
-        public OutputCommandOperation(string connectionStringName) : this(ConfigurationManager.ConnectionStrings[connectionStringName])
+        public OutputCommandOperation(string connectionStringName) 
+            : this(Use.ConnectionString(connectionStringName))
         {
         }
 
@@ -52,7 +52,7 @@ namespace Rhino.Etl.Core.Operations
                 if (PipelineExecuter.HasErrors)
                 {
                     Warn("Rolling back transaction in {0}", Name);
-                    transaction.Rollback();
+                    if (transaction != null) transaction.Rollback();
                     Warn("Rolled back transaction in {0}", Name);
                 }
                 else
